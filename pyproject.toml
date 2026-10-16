@@ -11,19 +11,19 @@ requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
-  "orbit-core>=0.1.0a1,<0.2",
   "orbit-sql>=0.1.0a1,<0.2",
-  "asyncmy>=0.2.11,<0.3",
+  "asyncmy>=0.2.12,<0.3",
   "pydantic>=2.8,<3",
 ]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.8,<1", "mypy>=1.13,<2"]
+core = ["orbit-core>=0.1.0a1,<0.2"]
+dev = ["orbit-core>=0.1.0a1,<0.2", "pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.8,<1", "mypy>=1.13,<2"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/orbit_sql_mysql"]

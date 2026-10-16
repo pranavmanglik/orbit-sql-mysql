@@ -14,8 +14,7 @@
 """MySQL provider adapter for Orbit SQL."""
 
 from orbit_sql_mysql.adapter import MySQLAdapter
-from orbit_sql_mysql.config import MySQLConfig
+from orbit_sql_mysql.config import MySQLConfig, MySQLReadReplica
 from orbit_sql_mysql.database import MySQLDatabase
-from orbit_sql_mysql.plugin import MySQLPlugin
 
-__all__ = ["MySQLAdapter", "MySQLConfig", "MySQLDatabase", "MySQLPlugin"]
+__all__ = ["MySQLAdapter", "MySQLConfig", "MySQLDatabase", "MySQLReadReplica"]

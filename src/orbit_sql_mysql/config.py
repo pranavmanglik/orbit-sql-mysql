@@ -18,6 +18,18 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, model_validator
 
 
+class MySQLReadReplica(BaseModel):
+    """Read-replica endpoint with separate credentials for a least-privilege reader account."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    host: str = Field(min_length=1, max_length=253)
+    port: int = Field(default=3306, ge=1, le=65535, strict=True)
+    weight: int = Field(default=1, ge=1, le=100, strict=True)
+    username: str = Field(min_length=1, max_length=128)
+    password: SecretStr
+
+
 class MySQLConfig(BaseModel):
     """Bounded pool settings with TLS peer verification enabled by default."""
 
@@ -36,15 +48,20 @@ class MySQLConfig(BaseModel):
     pool_recycle_seconds: int = Field(default=1_800, ge=60, le=86_400, strict=True)
     ssl: StrictBool = True
     ssl_ca: str | None = Field(default=None, min_length=1, max_length=4_096)
+    read_replicas: tuple[MySQLReadReplica, ...] = Field(default=(), max_length=32)
 
     @model_validator(mode="after")
     def validate_pool_bounds(self) -> MySQLConfig:
         """Require ordered pool bounds before handing settings to asyncmy."""
         if self.min_pool_size > self.max_pool_size:
             raise ValueError("min_pool_size must not exceed max_pool_size.")
+        if self.max_pool_size * (1 + len(self.read_replicas)) > 1_024:
+            raise ValueError(
+                "combined primary and replica max_pool_size must not exceed 1,024 connections."
+            )
         if self.ssl_ca is not None and not self.ssl:
             raise ValueError("ssl_ca requires TLS to be enabled.")
         return self
 
 
-__all__ = ["MySQLConfig"]
+__all__ = ["MySQLConfig", "MySQLReadReplica"]

@@ -1,82 +1,62 @@
-# Orbit SQL MySQL: operations and security
+# Orbit SQL MySQL: operations
 
-This guide organizes runtime behavior documented by the package. It does not certify production readiness. Verify provider/client versions, permissions, transport security, limits, and failure behavior in the target environment before release.
-
-## Configuration surface
-
-Environment names found in the package README:
-
-- `ORBIT_MYSQL_DSN`
-- `ORBIT_MYSQL_SSL_CA`
-
-Use the package README's constructor and deployment examples. Store credentials in a secret manager and avoid logging credentials, raw provider errors, request data, or opaque cursors.
-
-## Lifecycle, failure behavior, and limits
-
-`orbit-sql-mysql` implements Orbit's provider-neutral SQL contract with the asynchronous
-[`asyncmy`](https://github.com/long2ice/asyncmy) driver. It owns MySQL settings, TLS, its bounded
-connection pool, transaction scopes and provider error mapping. It does not bundle a framework,
-ORM, migration engine, or SQL abstraction.
+`orbit-sql-mysql` implements Orbit's SQL contract with the asyncmy connection pool. Install it with
+the Core runtime and SQL capability:
 
 ```bash
-pip install orbit-core orbit-data orbit-sql orbit-sql-mysql
+python -m pip install orbit-data orbit-sql orbit-sql-mysql
+# Add the Core lifecycle plugin only when the application uses it:
+python -m pip install 'orbit-sql-mysql[core]'
 ```
 
-TLS peer verification is enabled by default. Set `ssl_ca` when the server uses a private CA; the
-adapter still verifies the certificate chain and hostname. Credentials are represented as secret
-values in configuration and never included in adapter errors. Configure a least-privilege MySQL
-account and provide its password through a protected secret source. Set `ssl=False` only for a
-trusted local development service. Pool size, connect/command/close bounds, and idle connection
-recycling are explicit configuration values. The Core plugin opens the pool on first resolution and
-closes it under application lifecycle ownership.
+Configure `MySQLConfig` with `host`, `port`, `username`, `password`, and `database`. Pool size,
+connection timeout, command timeout, close timeout, connection recycle interval, and TLS CA path
+are explicit fields; see the [configuration model](../../src/orbit_sql_mysql/config.py) for their
+bounds and defaults. Prefer a secret manager for the password. `ssl` defaults to true, and
+`ssl_ca` adds a private CA while retaining certificate and hostname verification. Use `ssl=False`
+only with an isolated local development server.
 
-Orbit SQL query parameters use numbered `$1`, `$2`, … placeholders. This adapter converts those
-placeholders to the driver's bound `%s` form while ignoring strings, quoted identifiers and SQL
-comments; values are always passed separately. Result rows are detached and bounded. Explicit
-transactions pin one pool connection, commit on successful exit and roll back on exceptions or
-cancellation. MySQL DDL may have implicit-commit behavior defined by the server; do not assume it is
-fully transactional. This package does not claim distributed transactions or cross-provider SQL
-parity.
+## Pool ownership and shutdown
 
-```python
-from orbit import Application, ApplicationConfig
-from orbit_sql_mysql import MySQLConfig, MySQLPlugin
+`MySQLPlugin` registers a lazy `SQL_DATABASE_KEY` resource. Core owns its lifecycle and closes the
+pool at application shutdown. With `MySQLAdapter` and the registry directly, explicitly call
+`aclose()` when the application exits. Each database instance belongs to the event loop that opened
+it; do not transfer it across loops.
 
-app = Application(ApplicationConfig(name="orders"))
-app.plugins.register(
-    MySQLPlugin(
-        MySQLConfig(
-            host="127.0.0.1",
-            username="orders_app",
-            password="loaded-from-a-secret-manager",
-            database="orders",
-            ssl=False,  # local development only
-        )
-    )
-)
-```
+Pool shutdown first prevents new acquisitions and waits up to `close_timeout` for checked-out
+connections. On timeout or driver failure it terminates the pool and returns a sanitized
+`DatabaseError`. Cancellation during shutdown also terminates the pool before propagating
+cancellation.
 
-The default tests use a fake asyncmy pool. An opt-in live check covers parameter binding, bounded
-reads, transaction rollback, and pool cleanup against a disposable MySQL database. It creates and
-removes only a uniquely named table. Remote targets are skipped unless explicitly enabled; TLS
-remains on when testing a remote endpoint. Release validation must still include supported MySQL
-versions, TLS verification, cancellation behavior and hosted CI wheel builds for the asyncmy Cython
-extension. This package is pre-alpha and supports Python 3.11 through 3.14; the package suite passes
-on each version (the live-service test skips unless a DSN is supplied). The live check passed on
-Python 3.11 against TLS-enabled MySQL 8.4.11 with asyncmy 0.2.15; it does not validate the other
-supported Python or MySQL versions.
+## Statements and transaction outcomes
 
-For a disposable local TLS-enabled MySQL service, set the DSN and CA file, then run only the live
-test:
+Standalone writes use driver autocommit. Use `async with database.transaction()` to make several
+statements atomic. The transaction pins one pooled connection, commits on normal exit, and rolls
+back on errors and cancellation. MySQL DDL may implicitly commit according to server rules, even
+inside an explicit transaction.
 
-```bash
-ORBIT_MYSQL_DSN='mysql://orbit_test:orbit_test@127.0.0.1:53306/orbit_test' \
-ORBIT_MYSQL_SSL_CA='/path/to/test-ca.pem' \
-  pytest -q tests/test_live_mysql.py
-```
+Configure at most 32 weighted `MySQLReadReplica` entries with separate reader credentials.
+Pool bounds apply to the combined maximum across primary and replicas. Reads use primary by default;
+pass `read_preference=SQLReadPreference.REPLICA` for eventual-consistency reads. The adapter enforces
+the server's read-only transaction mode and fails closed if no replica is configured. MySQL allows
+temporary-table modifications inside read-only transactions, so keep replica credentials restricted
+to read-only access and configure the server accordingly. Replica
+failures do not cause query replay on primary. Monitor replication lag and use primary reads for
+read-after-write paths.
 
-Licensed under Apache-2.0.
+The adapter requires asyncmy 0.2.12 or later because that release closes a pooled connection when
+a query is cancelled during result reading. This prevents an interrupted result from being reused
+by a later caller. The adapter propagates cancellation; do not catch cancellation and continue
+using the same request's database operation as if it completed successfully.
 
-## Production validation
+Command timeout and task cancellation can occur after the server accepted a write. The application
+may not know whether that write committed. Reconcile before retrying non-idempotent operations, or
+use application-level idempotency keys and database constraints.
 
-Validate startup/shutdown cleanup, timeout and cancellation behavior, concurrency and payload bounds where applicable, secret rotation and least-privilege access, data durability, backup/restore, and failover against the selected provider. Do not infer distributed or durable guarantees from an in-process API or fake-client tests.
+## Live verification
+
+Unit tests use a fake pool and do not validate server versions, TLS behavior, permissions, or
+durability. `tests/test_live_mysql.py` is opt-in and must target a disposable test database; it
+creates and removes a uniquely named table. For a TLS-enabled test target, set
+`ORBIT_MYSQL_DSN` and `ORBIT_MYSQL_SSL_CA` as described in the package README. Never point the live
+test at production data.

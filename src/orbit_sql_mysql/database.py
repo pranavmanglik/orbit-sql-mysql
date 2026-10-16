@@ -27,7 +27,15 @@ from uuid import UUID
 
 import asyncmy
 from asyncmy.cursors import SSDictCursor
-from orbit_sql import DatabaseError, SQLExecution, SQLParameters, SQLRow, SQLTransaction, SQLValue
+from orbit_sql import (
+    DatabaseError,
+    SQLExecution,
+    SQLParameters,
+    SQLReadPreference,
+    SQLRow,
+    SQLTransaction,
+    SQLValue,
+)
 
 from orbit_sql_mysql.config import MySQLConfig
 
@@ -48,9 +56,7 @@ class _Cursor(Protocol):
     async def fetchone(self) -> Mapping[str, SQLValue] | Sequence[SQLValue] | None:
         """Fetch one row from the current result, if present."""
 
-    async def fetchmany(
-        self, size: int = 1
-    ) -> list[Mapping[str, SQLValue] | Sequence[SQLValue]]:
+    async def fetchmany(self, size: int = 1) -> list[Mapping[str, SQLValue] | Sequence[SQLValue]]:
         """Fetch at most the requested number of rows."""
 
     async def __aenter__(self) -> _Cursor:
@@ -105,12 +111,35 @@ class _Pool(Protocol):
 class MySQLDatabase:
     """Pooled, bounded MySQL access with redacted errors and explicit transaction scopes."""
 
-    def __init__(self, pool: _Pool, *, command_timeout: float, close_timeout: float) -> None:
+    def __init__(
+        self,
+        pool: _Pool,
+        *,
+        read_replica_pools: tuple[tuple[_Pool, int], ...] = (),
+        command_timeout: float,
+        close_timeout: float,
+    ) -> None:
         """Wrap an open asyncmy pool; applications should normally use `open`."""
-        for method in ("acquire", "close", "wait_closed", "terminate"):
-            if not callable(getattr(pool, method, None)):
-                raise TypeError(f"pool must provide callable {method} method.")
+        pools = (pool, *(replica for replica, _ in read_replica_pools))
+        for candidate in pools:
+            for method in ("acquire", "close", "wait_closed", "terminate"):
+                if not callable(getattr(candidate, method, None)):
+                    raise TypeError(f"all MySQL pools must provide callable {method} methods.")
+        if any(
+            isinstance(weight, bool) or not isinstance(weight, int) or not 1 <= weight <= 100
+            for _, weight in read_replica_pools
+        ):
+            raise ValueError("MySQL read replica weights must be between 1 and 100.")
+        if len(read_replica_pools) > 32:
+            raise ValueError("MySQL supports at most 32 configured read replicas.")
         self._pool = pool
+        self._read_replica_pools = tuple(read_replica_pools)
+        self._weighted_replica_pools = tuple(
+            candidate
+            for replica, weight in self._read_replica_pools
+            for candidate in (replica,) * weight
+        )
+        self._replica_cursor = 0
         self._command_timeout = command_timeout
         self._close_timeout = close_timeout
         self._loop = asyncio.get_running_loop()
@@ -125,14 +154,21 @@ class MySQLDatabase:
         tls: ssl.SSLContext | None = (
             ssl.create_default_context(cafile=config.ssl_ca) if config.ssl else None
         )
-        try:
+        created_pools: list[_Pool] = []
+
+        async def create_pool(
+            host: str,
+            port: int,
+            username: str,
+            password: str,
+        ) -> _Pool:
             pool = cast(
                 _Pool,
                 await asyncmy.create_pool(
-                    host=config.host,
-                    port=config.port,
-                    user=config.username,
-                    password=config.password.get_secret_value(),
+                    host=host,
+                    port=port,
+                    user=username,
+                    password=password,
                     db=config.database,
                     minsize=config.min_pool_size,
                     maxsize=config.max_pool_size,
@@ -143,17 +179,52 @@ class MySQLDatabase:
                     ssl=tls,
                 ),
             )
+            created_pools.append(pool)
+            return pool
+
+        try:
+            pool = await create_pool(
+                config.host,
+                config.port,
+                config.username,
+                config.password.get_secret_value(),
+            )
+            replica_pools: list[tuple[_Pool, int]] = []
+            for replica in config.read_replicas:
+                replica_pools.append(
+                    (
+                        await create_pool(
+                            replica.host,
+                            replica.port,
+                            replica.username,
+                            replica.password.get_secret_value(),
+                        ),
+                        replica.weight,
+                    )
+                )
         except asyncio.CancelledError:
+            for created in created_pools:
+                created.terminate()
             raise
         except Exception:
+            for created in created_pools:
+                created.terminate()
             raise DatabaseError(
-                "database.connection-failed", "MySQL connection could not be opened."
+                "database.connection-failed", "MySQL primary and replica pools could not be opened."
             ) from None
-        return cls(pool, command_timeout=config.command_timeout, close_timeout=config.close_timeout)
+        return cls(
+            pool,
+            read_replica_pools=tuple(replica_pools),
+            command_timeout=config.command_timeout,
+            close_timeout=config.close_timeout,
+        )
 
     async def execute(self, statement: str, parameters: SQLParameters = ()) -> SQLExecution:
-        """Execute one bounded, parameterized MySQL statement."""
-        """Execute one parameterized statement and report affected rows and generated id."""
+        """Execute one parameterized statement and report affected rows and generated ID.
+
+        The pool is configured for autocommit, so successful standalone writes are committed
+        before this method returns. Use :meth:`transaction` for atomic multi-statement work.
+        """
         query, values = _prepare(statement, parameters)
         self._ensure_open()
         try:
@@ -170,9 +241,17 @@ class MySQLDatabase:
         except Exception as exc:
             raise _mysql_error(exc) from None
 
-    async def fetch_one(self, statement: str, parameters: SQLParameters = ()) -> SQLRow | None:
-        """Fetch one MySQL row or return ``None`` when there is no result."""
-        """Fetch one detached result row from a server-side cursor."""
+    async def fetch_one(
+        self,
+        statement: str,
+        parameters: SQLParameters = (),
+        *,
+        read_preference: SQLReadPreference = SQLReadPreference.PRIMARY,
+    ) -> SQLRow | None:
+        """Fetch one detached MySQL result row, or ``None`` when there is no result."""
+        if read_preference is not SQLReadPreference.PRIMARY:
+            async with self.transaction(read_preference=read_preference) as transaction:
+                return await transaction.fetch_one(statement, parameters)
         query, values = _prepare(statement, parameters)
         self._ensure_open()
         try:
@@ -191,10 +270,17 @@ class MySQLDatabase:
             raise _mysql_error(exc) from None
 
     async def fetch_all(
-        self, statement: str, parameters: SQLParameters = (), *, limit: int = 1_000
+        self,
+        statement: str,
+        parameters: SQLParameters = (),
+        *,
+        limit: int = 1_000,
+        read_preference: SQLReadPreference = SQLReadPreference.PRIMARY,
     ) -> tuple[SQLRow, ...]:
-        """Fetch no more than ``limit`` rows and reject an oversized result."""
-        """Read at most one row over the requested bound and reject overflow."""
+        """Read at most ``limit + 1`` rows and reject results that exceed ``limit``."""
+        if read_preference is not SQLReadPreference.PRIMARY:
+            async with self.transaction(read_preference=read_preference) as transaction:
+                return await transaction.fetch_all(statement, parameters, limit=limit)
         _validate_limit(limit)
         query, values = _prepare(statement, parameters)
         self._ensure_open()
@@ -218,10 +304,13 @@ class MySQLDatabase:
             raise _mysql_error(exc) from None
 
     @asynccontextmanager
-    async def transaction(self) -> AsyncIterator[SQLTransaction]:
+    async def transaction(
+        self, *, read_preference: SQLReadPreference = SQLReadPreference.PRIMARY
+    ) -> AsyncIterator[SQLTransaction]:
         """Pin one pool connection; commit on success, rollback on any failure or cancellation."""
         self._ensure_open()
-        acquire = self._pool.acquire()
+        pool, read_only = self._pool_for_read(read_preference)
+        acquire = pool.acquire()
         try:
             connection = await acquire.__aenter__()
         except asyncio.CancelledError:
@@ -233,7 +322,14 @@ class MySQLDatabase:
         transaction = _MySQLTransaction(self, connection)
         try:
             try:
-                await connection.begin()
+                if read_only:
+                    async with connection.cursor(SSDictCursor) as cursor:
+                        await asyncio.wait_for(
+                            cursor.execute("START TRANSACTION READ ONLY", ()),
+                            self._command_timeout,
+                        )
+                else:
+                    await connection.begin()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -307,21 +403,46 @@ class MySQLDatabase:
                 return
             self._closed = True
             try:
-                self._pool.close()
-                await asyncio.wait_for(self._pool.wait_closed(), timeout=self._close_timeout)
+                pools = (self._pool, *(pool for pool, _ in self._read_replica_pools))
+                for pool in pools:
+                    pool.close()
+                await asyncio.wait_for(
+                    asyncio.gather(*(pool.wait_closed() for pool in pools)),
+                    timeout=self._close_timeout,
+                )
             except asyncio.CancelledError:
                 self._pool.terminate()
+                for pool, _ in self._read_replica_pools:
+                    pool.terminate()
                 raise
             except TimeoutError:
                 self._pool.terminate()
+                for pool, _ in self._read_replica_pools:
+                    pool.terminate()
                 raise DatabaseError(
-                    "database.close-timeout", "MySQL pool did not drain before shutdown."
+                    "database.close-timeout", "MySQL pools did not drain before shutdown."
                 ) from None
             except Exception:
                 self._pool.terminate()
+                for pool, _ in self._read_replica_pools:
+                    pool.terminate()
                 raise DatabaseError(
-                    "database.close-failed", "MySQL pool could not close cleanly."
+                    "database.close-failed", "MySQL pools could not close cleanly."
                 ) from None
+
+    def _pool_for_read(self, preference: SQLReadPreference) -> tuple[_Pool, bool]:
+        """Select the primary or weighted replica and mark replica transactions read-only."""
+        if not isinstance(preference, SQLReadPreference):
+            raise ValueError("read_preference must be a SQLReadPreference value.")
+        if preference is SQLReadPreference.PRIMARY:
+            return self._pool, False
+        if not self._weighted_replica_pools:
+            raise DatabaseError(
+                "database.replica-unavailable", "No MySQL read replicas are configured."
+            )
+        pool = self._weighted_replica_pools[self._replica_cursor]
+        self._replica_cursor = (self._replica_cursor + 1) % len(self._weighted_replica_pools)
+        return pool, True
 
     def _ensure_open(self) -> None:
         self._ensure_loop()

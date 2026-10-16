@@ -13,11 +13,11 @@
 # limitations under the License.
 """Optional Core plugin wiring the MySQL provider under Core resource ownership."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 
 from orbit import Application
-from orbit.plugins import Plugin, PluginMetadata
+from orbit.plugins import ControlAction, ControlResult, Plugin, PluginMetadata
 from orbit_sql import SQL_DATABASE_KEY
 
 from orbit_sql_mysql.config import MySQLConfig
@@ -38,6 +38,14 @@ class MySQLPlugin(Plugin):
         if not isinstance(config, MySQLConfig):
             raise TypeError("MySQLPlugin requires MySQLConfig.")
         self._config = config
+        self.control_actions = (
+            ControlAction(
+                id="check-connection",
+                title="Check MySQL database",
+                description="Run a read-only SELECT 1 against a temporary bounded pool.",
+                handler=self._check_connection,
+            ),
+        )
 
     def setup(self, application: Application) -> None:
         """Register a lazy SQL resource during plugin setup."""
@@ -53,6 +61,12 @@ class MySQLPlugin(Plugin):
             yield database
         finally:
             await database.aclose()
+
+    async def _check_connection(self, _: Mapping[str, object]) -> ControlResult:
+        """Run a read-only connectivity query and close all temporary pool resources."""
+        async with self._database() as database:
+            await database.fetch_one("SELECT 1")
+        return ControlResult("MySQL database is reachable.")
 
 
 __all__ = ["MySQLPlugin"]

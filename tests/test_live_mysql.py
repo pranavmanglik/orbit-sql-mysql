@@ -75,15 +75,11 @@ async def test_live_mysql_queries_transaction_rollback_and_cleanup() -> None:
                 )
                 raise RuntimeError("rollback sentinel")
 
-        row = await database.fetch_one(
-            f"SELECT id, value FROM {quoted_table} WHERE id = $1", (1,)
-        )
+        row = await database.fetch_one(f"SELECT id, value FROM {quoted_table} WHERE id = $1", (1,))
         rows = await database.fetch_all(
             f"SELECT id, value FROM {quoted_table} ORDER BY id", limit=10
         )
-        rolled_back = await database.fetch_one(
-            f"SELECT id FROM {quoted_table} WHERE id = $1", (2,)
-        )
+        rolled_back = await database.fetch_one(f"SELECT id FROM {quoted_table} WHERE id = $1", (2,))
         assert row is not None and dict(row) == {"id": 1, "value": "committed"}
         assert tuple(dict(result) for result in rows) == ({"id": 1, "value": "committed"},)
         assert rolled_back is None

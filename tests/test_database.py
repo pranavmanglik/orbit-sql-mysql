@@ -3,16 +3,41 @@
 from __future__ import annotations
 
 import asyncio
+import tomllib
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import asyncmy
 import pytest
-from orbit_sql import DatabaseError, SQLDatabase
+from orbit_sql import DatabaseError, SQLDatabase, SQLReadPreference, SQLReadRouting
 from pydantic import SecretStr, ValidationError
 
-from orbit_sql_mysql import MySQLConfig, MySQLDatabase, MySQLPlugin
+from orbit_sql_mysql import MySQLConfig, MySQLDatabase, MySQLReadReplica
 from orbit_sql_mysql import database as database_module
+from orbit_sql_mysql.plugin import MySQLPlugin
+
+
+def test_asyncmy_dependency_floor_includes_cancelled_read_connection_discard_fix() -> None:
+    """Do not allow a driver version that can reuse stale results after task cancellation."""
+    manifest = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    asyncmy_requirement = next(
+        requirement
+        for requirement in manifest["project"]["dependencies"]
+        if requirement.startswith("asyncmy")
+    )
+    assert asyncmy_requirement == "asyncmy>=0.2.12,<0.3"
+
+
+def test_core_lifecycle_dependency_is_optional() -> None:
+    """The SQL provider can be used without Core unless its plugin extra is installed."""
+    manifest = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    assert not any(dep.startswith("orbit-core") for dep in manifest["dependencies"])
+    assert manifest["optional-dependencies"]["core"] == ["orbit-core>=0.1.0a1,<0.2"]
 
 
 class FakeCursor:
@@ -32,6 +57,7 @@ class FakeCursor:
 
     async def execute(self, query: str, args: Sequence[object] = ()) -> int:
         self.connection.query = query
+        self.connection.executed_queries.append(query)
         self.connection.args = tuple(args)
         return self.rowcount
 
@@ -48,6 +74,7 @@ class FakeConnection:
 
     def __init__(self) -> None:
         self.query = ""
+        self.executed_queries: list[str] = []
         self.args: tuple[object, ...] = ()
         self.read_bound = 0
         self.begun = 0
@@ -107,6 +134,7 @@ async def test_mysql_implements_contract_and_binds_numbered_values() -> None:
     pool = FakePool()
     database = MySQLDatabase(pool, command_timeout=2, close_timeout=1)
     assert isinstance(database, SQLDatabase)
+    assert isinstance(database, SQLReadRouting)
 
     result = await database.execute("INSERT INTO notes (name) VALUES ($1)", ("Orbit",))
     row = await database.fetch_one("SELECT id, name FROM notes WHERE id = $1", (42,))
@@ -120,6 +148,88 @@ async def test_mysql_implements_contract_and_binds_numbered_values() -> None:
     assert pool.acquire_context.released == 3
     await database.aclose()
     assert pool.closed == 1
+
+
+async def test_explicit_replica_reads_are_weighted_and_server_read_only() -> None:
+    """Replica reads use weighted pools and issue a server-enforced read-only transaction."""
+    primary, replica_one, replica_two = FakePool(), FakePool(), FakePool()
+    database = MySQLDatabase(
+        primary,
+        read_replica_pools=((replica_one, 1), (replica_two, 2)),
+        command_timeout=2,
+        close_timeout=1,
+    )
+    try:
+        for _ in range(3):
+            row = await database.fetch_one(
+                "SELECT id FROM notes", read_preference=SQLReadPreference.REPLICA
+            )
+            assert row is not None
+        assert primary.connection.executed_queries == []
+        assert replica_one.connection.executed_queries == [
+            "START TRANSACTION READ ONLY",
+            "SELECT id FROM notes",
+        ]
+        assert replica_two.connection.executed_queries == [
+            "START TRANSACTION READ ONLY",
+            "SELECT id FROM notes",
+            "START TRANSACTION READ ONLY",
+            "SELECT id FROM notes",
+        ]
+        assert replica_one.connection.committed == 1
+        assert replica_two.connection.committed == 2
+    finally:
+        await database.aclose()
+    assert primary.closed == replica_one.closed == replica_two.closed == 1
+
+
+async def test_replica_reads_fail_closed_without_replica_configuration() -> None:
+    """Replica intent never silently routes to primary when no replica is configured."""
+    pool = FakePool()
+    database = MySQLDatabase(pool, command_timeout=2, close_timeout=1)
+    try:
+        with pytest.raises(DatabaseError) as caught:
+            await database.fetch_one("SELECT 1", read_preference=SQLReadPreference.REPLICA)
+        assert caught.value.code == "database.replica-unavailable"
+        assert pool.connection.executed_queries == []
+    finally:
+        await database.aclose()
+
+
+def test_mysql_replica_configuration_bounds_and_credential_pairing() -> None:
+    """Replica topology limits and optional credential overrides are validated and redacted."""
+    replica = MySQLReadReplica(
+        host="reader.example.test",
+        username="reader",
+        password="private-password",
+        weight=3,
+    )
+    config = MySQLConfig(
+        host="writer.example.test",
+        username="writer",
+        password="private-password",
+        database="orbit",
+        read_replicas=(replica,),
+    )
+    assert "private-password" not in repr(config)
+    with pytest.raises(ValidationError):
+        MySQLReadReplica(host="reader.example.test")
+    with pytest.raises(ValidationError, match="1,024 connections"):
+        MySQLConfig(
+            host="writer.example.test",
+            username="writer",
+            password="private-password",
+            database="orbit",
+            max_pool_size=32,
+            read_replicas=tuple(
+                MySQLReadReplica(
+                    host=f"reader-{index}.example.test",
+                    username="reader",
+                    password="private-password",
+                )
+                for index in range(32)
+            ),
+        )
 
 
 async def test_transactions_commit_or_rollback_and_release_connection() -> None:
@@ -189,6 +299,42 @@ async def test_open_uses_tls_bounded_pool_and_secret_password(
     await database.aclose()
 
 
+async def test_open_creates_and_closes_primary_and_replica_pools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opening the provider owns every configured endpoint and its credential settings."""
+    pools = [FakePool(), FakePool()]
+    settings: list[dict[str, object]] = []
+
+    async def create_pool(**kwargs: object) -> FakePool:
+        settings.append(kwargs)
+        return pools[len(settings) - 1]
+
+    monkeypatch.setattr(asyncmy, "create_pool", create_pool)
+    config = MySQLConfig(
+        host="writer.example.test",
+        username="writer",
+        password="writer-secret",
+        database="orbit",
+        read_replicas=(
+            MySQLReadReplica(
+                host="reader.example.test",
+                username="reader",
+                password="reader-secret",
+                weight=2,
+            ),
+        ),
+    )
+    database = await MySQLDatabase.open(config)
+    assert [entry["host"] for entry in settings] == [
+        "writer.example.test",
+        "reader.example.test",
+    ]
+    assert [entry["user"] for entry in settings] == ["writer", "reader"]
+    await database.aclose()
+    assert [pool.closed for pool in pools] == [1, 1]
+
+
 def test_pool_bounds_and_unverified_tls_are_explicit() -> None:
     with pytest.raises(ValidationError):
         MySQLConfig(
@@ -243,3 +389,25 @@ def test_mysql_plugin_registers_lazily_under_shared_capability_key() -> None:
     application.plugins.setup(application)
     assert SQL_DATABASE_KEY in application.container.providers
     assert application.container.providers[SQL_DATABASE_KEY].resource
+
+
+async def test_mysql_plugin_contributes_a_read_only_control_room_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI check executes SELECT 1 and releases its temporary pool."""
+    pool = FakePool()
+
+    async def create_pool(**_settings: object) -> FakePool:
+        return pool
+
+    monkeypatch.setattr(asyncmy, "create_pool", create_pool)
+    plugin = MySQLPlugin(
+        MySQLConfig(host="localhost", username="app", password="secret", database="app", ssl=False)
+    )
+
+    result = await plugin.control_actions[0].handler({})
+
+    assert result is not None
+    assert result.summary == "MySQL database is reachable."
+    assert pool.connection.query == "SELECT 1"
+    assert pool.closed == 1
